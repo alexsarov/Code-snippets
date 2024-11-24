@@ -69,7 +69,6 @@ async def resend_messages(topic_name, sub_name, need_session):
 async def do():    
     try:
         start_time = time.time()   
-        tasks = []   
         dlq_topics = get_dlq_topics()
         if not dlq_topics: 
             return 
