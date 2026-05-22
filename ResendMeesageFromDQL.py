@@ -52,33 +52,11 @@ def get_dlq_topics(conn_str: str) -> list[dict[str, Any]]:
                     {
                         "topic": topic_name,
                         "subscription": subscription_name,
-                        "requires_session": subscription.requires_session,
                         "dlq_count": dead_letter_count,
                     }
                 )
 
     return result
-
-
-def normalize_property_key(key: Any) -> str:
-    if isinstance(key, bytes):
-        return key.decode("utf-8")
-    return str(key)
-
-
-def normalize_property_value(value: Any) -> Any:
-    if isinstance(value, bytes):
-        try:
-            return value.decode("utf-8")
-        except UnicodeDecodeError:
-            return value
-    return value
-
-
-def extract_body(message) -> bytes:
-    # Do not use str(message), because it does not preserve the original payload.
-    return b"".join(chunk for chunk in message.body)
-
 
 def build_replay_message(message, subscription_name: str) -> ServiceBusMessage:
     ignored_properties = {
@@ -88,57 +66,41 @@ def build_replay_message(message, subscription_name: str) -> ServiceBusMessage:
 
     user_properties = {}
 
-    # Copy only custom application properties.
+    # Copy custom application properties except DLQ system-related fields.
     for key, value in (message.application_properties or {}).items():
-        prop_key = normalize_property_key(key)
+        prop_key = key.decode() if isinstance(key, bytes) else str(key)
 
         if prop_key in ignored_properties:
             continue
 
-        user_properties[prop_key] = normalize_property_value(value)
-
-    enqueued_time_utc_original = user_properties.get(
-        "enqueued_time_utc_original",
-        message.enqueued_time_utc.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-    )
+        user_properties[prop_key] = (
+            value.decode() if isinstance(value, bytes) else value
+        )
 
     application_properties = {
         **user_properties,
-
-        "sub_name": subscription_name, # most IMPORTANT column, used to filter messages inside topic
-        "enqueued_time_utc_original": enqueued_time_utc_original,
+        "sub_name": subscription_name,
+        "enqueued_time_utc_original": user_properties.get(
+            "enqueued_time_utc_original",
+            message.enqueued_time_utc.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        ),
         "dlq_replayed": True,
-
-        # Preserve original broker message id as metadata,
-        # but do not reuse it as the new broker message_id.
         "original_message_id": message.message_id,
     }
 
     return ServiceBusMessage(
-        body=extract_body(message),
-
-        # Keep the original session id.
-        # This is important if the topic/subscription is session-enabled.
+        str(message),
         session_id=message.session_id,
-
-        # Optional, but usually safe and useful.
-        # Keep only if your consumers or subscription filters use it.
-        subject=message.subject,
-        content_type=message.content_type,
-
         application_properties=application_properties,
     )
-
 
 async def resend_messages(
     servicebus_client: ServiceBusClient,
     topic_name: str,
-    subscription_name: str,
-    requires_session: bool,) -> dict[str, Any]:
+    subscription_name: str,) -> dict[str, Any]:
     result = {
         "topic": topic_name,
         "subscription": subscription_name,
-        "requires_session": requires_session,
         "processed": 0,
         "failed": 0,
     }
@@ -222,7 +184,6 @@ async def do() -> None:
                     servicebus_client=servicebus_client,
                     topic_name=item["topic"],
                     subscription_name=item["subscription"],
-                    requires_session=item["requires_session"],
                 )
                 for item in dlq_topics
             ]
