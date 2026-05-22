@@ -1,83 +1,251 @@
 import asyncio
+import json
+import os
 import time
 import traceback
-import json
-from slack_sdk import WebClient
-from azure.servicebus.aio import ServiceBusClient
-from azure.servicebus.aio import AutoLockRenewer
-from azure.servicebus import ServiceBusMessage
+from typing import Any
+
+from slack_sdk.web.async_client import AsyncWebClient
+
+from azure.servicebus import ServiceBusMessage, ServiceBusSubQueue
+from azure.servicebus.aio import ServiceBusClient, AutoLockRenewer
 from azure.servicebus.management import ServiceBusAdministrationClient
 
-def send_message_to_slack(message):
-    WebClient(token="Youe slack token here").chat_postMessage(channel="Id of the channel", text=message)
 
-def get_dlq_topics(conn):     
-    servicebus_client = ServiceBusAdministrationClient.from_connection_string(conn)
-    final_list = []
-    #iterate through all topic and subscriptions and get dead_letter_message_count
-    for t in servicebus_client.list_topics():
-        for s in servicebus_client.list_subscriptions(t["name"]):
-            dead_letter_number = servicebus_client.get_subscription_runtime_properties(t["name"],s["name"]).dead_letter_message_count
-            if dead_letter_number > 0:
-                final_dict = {"topic": t["name"], "subscription": s["name"], "needSession": s.requires_session, "qnt": dead_letter_number}
-                final_list.append(final_dict.copy())
-    return final_list
+SERVICE_BUS_CONN_STR = os.environ["SERVICE_BUS_CONN_STR"]
+SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
+SLACK_CHANNEL_ID = os.environ["SLACK_CHANNEL_ID"]
 
-async def create_servicebus_sender_async(topic_name):  
-    sb_client = ServiceBusClient.from_connection_string(conn_str="Your conn")
-    return sb_client.get_topic_sender(topic_name=topic_name)
-     
-async def create_servicebus_receiver_async(topic_name, subscription_name):  
-    sb_client = ServiceBusClient.from_connection_string(conn_str="Your conn")
-    return sb_client.get_subscription_receiver(
+MAX_MESSAGES_PER_RECEIVE = int(os.getenv("MAX_MESSAGES_PER_RECEIVE", "200"))
+MAX_LOCK_RENEWAL_SECONDS = int(os.getenv("MAX_LOCK_RENEWAL_SECONDS", "300"))
+
+
+async def send_message_to_slack(message: str) -> None:
+    slack_client = AsyncWebClient(token=SLACK_BOT_TOKEN)
+    await slack_client.chat_postMessage(
+        channel=SLACK_CHANNEL_ID,
+        text=message,
+    )
+
+
+def get_dlq_topics(conn_str: str) -> list[dict[str, Any]]:
+    admin_client = ServiceBusAdministrationClient.from_connection_string(conn_str)
+
+    result = []
+
+    # Scan all topics and subscriptions and find DLQs with messages.
+    for topic in admin_client.list_topics():
+        topic_name = topic.name
+
+        for subscription in admin_client.list_subscriptions(topic_name):
+            subscription_name = subscription.name
+
+            runtime_props = admin_client.get_subscription_runtime_properties(
+                topic_name,
+                subscription_name,
+            )
+
+            dead_letter_count = runtime_props.dead_letter_message_count
+
+            if dead_letter_count > 0:
+                result.append(
+                    {
+                        "topic": topic_name,
+                        "subscription": subscription_name,
+                        "requires_session": subscription.requires_session,
+                        "dlq_count": dead_letter_count,
+                    }
+                )
+
+    return result
+
+
+def normalize_property_key(key: Any) -> str:
+    if isinstance(key, bytes):
+        return key.decode("utf-8")
+    return str(key)
+
+
+def normalize_property_value(value: Any) -> Any:
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            return value
+    return value
+
+
+def extract_body(message) -> bytes:
+    # Do not use str(message), because it does not preserve the original payload.
+    return b"".join(chunk for chunk in message.body)
+
+
+def build_replay_message(message, subscription_name: str) -> ServiceBusMessage:
+    ignored_properties = {
+        "DeadLetterReason",
+        "DeadLetterErrorDescription",
+    }
+
+    user_properties = {}
+
+    # Copy only custom application properties.
+    for key, value in (message.application_properties or {}).items():
+        prop_key = normalize_property_key(key)
+
+        if prop_key in ignored_properties:
+            continue
+
+        user_properties[prop_key] = normalize_property_value(value)
+
+    enqueued_time_utc_original = user_properties.get(
+        "enqueued_time_utc_original",
+        message.enqueued_time_utc.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+    )
+
+    application_properties = {
+        **user_properties,
+
+        "sub_name": subscription_name, # most IMPORTANT column, used to filter messages inside topic
+        "enqueued_time_utc_original": enqueued_time_utc_original,
+        "dlq_replayed": True,
+
+        # Preserve original broker message id as metadata,
+        # but do not reuse it as the new broker message_id.
+        "original_message_id": message.message_id,
+    }
+
+    return ServiceBusMessage(
+        body=extract_body(message),
+
+        # Keep the original session id.
+        # This is important if the topic/subscription is session-enabled.
+        session_id=message.session_id,
+
+        # Optional, but usually safe and useful.
+        # Keep only if your consumers or subscription filters use it.
+        subject=message.subject,
+        content_type=message.content_type,
+
+        application_properties=application_properties,
+    )
+
+
+async def resend_messages(
+    servicebus_client: ServiceBusClient,
+    topic_name: str,
+    subscription_name: str,
+    requires_session: bool,) -> dict[str, Any]:
+    result = {
+        "topic": topic_name,
+        "subscription": subscription_name,
+        "requires_session": requires_session,
+        "processed": 0,
+        "failed": 0,
+    }
+
+    lock_renewer = AutoLockRenewer()
+
+    receiver = servicebus_client.get_subscription_receiver(
         topic_name=topic_name,
         subscription_name=subscription_name,
-        sub_queue= "deadletter"
+        sub_queue=ServiceBusSubQueue.DEAD_LETTER,
+        max_wait_time=5,
+    )
+
+    sender = servicebus_client.get_topic_sender(topic_name=topic_name)
+
+    try:
+        async with receiver, sender:
+            messages = await receiver.receive_messages(
+                max_message_count=MAX_MESSAGES_PER_RECEIVE,
+                max_wait_time=5,
+            )
+
+            for message in messages:
+                try:
+                    lock_renewer.register(
+                        receiver,
+                        message,
+                        max_lock_renewal_duration=MAX_LOCK_RENEWAL_SECONDS,
+                    )
+
+                    replay_message = build_replay_message(
+                        message=message,
+                        subscription_name=subscription_name,
+                    )
+
+                    await sender.send_messages(replay_message)
+
+                    # Complete the DLQ message only after successful resend.
+                    await receiver.complete_message(message)
+
+                    result["processed"] += 1
+
+                except Exception as ex:
+                    result["failed"] += 1
+                    result.setdefault("errors", []).append(
+                        {
+                            "message_id": message.message_id,
+                            "session_id": message.session_id,
+                            "error": repr(ex),
+                        }
+                    )
+
+                    # Do not complete the message if resend failed.
+                    # It will remain in DLQ for the next retry.
+
+    except Exception as ex:
+        result["error"] = repr(ex)
+
+    finally:
+        await lock_renewer.close()
+
+    return result
+
+
+async def do() -> None:
+    start_time = time.time()
+
+    try:
+        dlq_topics = get_dlq_topics(SERVICE_BUS_CONN_STR)
+
+        if not dlq_topics:
+            #stop and do nothing
+            return
+
+        async with ServiceBusClient.from_connection_string(
+            conn_str=SERVICE_BUS_CONN_STR,
+            logging_enable=False,
+        ) as servicebus_client:
+            tasks = [
+                resend_messages(
+                    servicebus_client=servicebus_client,
+                    topic_name=item["topic"],
+                    subscription_name=item["subscription"],
+                    requires_session=item["requires_session"],
+                )
+                for item in dlq_topics
+            ]
+
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        safe_results = [
+            repr(item) if isinstance(item, Exception) else item
+            for item in results
+        ]
+
+        await send_message_to_slack(
+            "Messages from DLQ Service Bus were handled:\n"
+            f"```{json.dumps(safe_results, indent=2, default=str)}```\n"
+            f"TimeInSec: {round(time.time() - start_time, 1)}"
         )
 
-async def resend_messages(topic_name, sub_name, need_session):
-    #we need dc for monitoring, at the end the notification with number of message will be send to slack
-    dc = {"topic":topic_name, "subscirption": sub_name}
-    lock_renewal = AutoLockRenewer()
-    servicebus_receiver = await create_servicebus_receiver_async(topic_name, sub_name)
-    servicebus_sender = await create_servicebus_sender_async(topic_name)
-    async with servicebus_receiver, servicebus_sender:       
-        messages = await servicebus_receiver.receive_messages(max_message_count = 200)
-        for message in messages:
-            lock_renewal.register(servicebus_receiver, message, max_lock_renewal_duration=200)
-            #get all message properties
-            for key, val in message.application_properties.items():
-                if key.decode() in ["DeadLetterReason","DeadLetterErrorDescription"]:
-                    continue
-                user_properties = {key.decode(): (val.decode() if isinstance(val, bytes) else val)}
-            #if enqueued_time_utc_original was found set it, other wise take enqueued_time_utc 
-            message_app_prop = {"sub_name" : sub_name,
-                                "enqueued_time_utc_original":user_properties.get("enqueued_time_utc_original",message.enqueued_time_utc.strftime("%Y-%m-%dT%H:%M:%S.%fZ"))}  
-            message_app_prop = {**message_app_prop, **user_properties}
-            sb_mmsg = ServiceBusMessage(str(message),
-                                        subject=message.subject,
-                                        session_id=message.session_id if need_session == True else None
-                                        )
-            sb_mmsg.application_properties = message_app_prop            
-            await servicebus_sender.send_messages(sb_mmsg)
-            await servicebus_receiver.complete_message(message)
-            dc['qnt'] = dc.get('qnt',0) + 1   
-    await lock_renewal.close()
-    return dc  
+    except Exception:
+        await send_message_to_slack(
+            "DLQ replay script failed:\n"
+            f"```{traceback.format_exc()}```"
+        )
 
 
-async def do():    
-    try:
-        start_time = time.time()   
-        dlq_topics = get_dlq_topics()
-        if not dlq_topics: 
-            return 
-        tasks = [asyncio.create_task(resend_messages(i["topic"], i["subscription"], i["needSession"])) for i in dlq_topics]
-        result = await asyncio.gather (*tasks, return_exceptions=True) 
-        send_message_to_slack(f'Messages from DLQ ServiceBus were handled:   \n{json.dumps(result)}   \nTimeInSec: {round((time.time() - start_time),1)}')
-    except:
-        send_message_to_slack(traceback.format_exc())
- 
 if __name__ == "__main__":
-    asyncio.run(do ()) 
-
+    asyncio.run(do())
